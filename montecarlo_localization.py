@@ -144,9 +144,15 @@ def sample_pose_uniform(xmin, xmax, ymin, ymax):
     pass
 
 
-def draw_map_state(gmap, particle_list=None, title="Wean Hall Map"):
+def draw_map_state(gmap, particle_list=None, title="Wean Hall Map", rotate=False):
     fig, ax = plt.subplots(figsize=(10, 10))
-    ax.imshow(gmap.values, cmap=plt.cm.gray, interpolation='nearest')
+    if rotate:
+        values = gmap.values.T
+        ax.set_ylim(250,750)
+    else:
+        values = gmap.values
+        ax.set_xlim(250,750)
+    ax.imshow(values, cmap=plt.cm.gray, interpolation='nearest')
     ax.set_title(title)
     # Move left and bottom spines outward by 10 points
     ax.spines['left'].set_position(('outward', 10))
@@ -157,7 +163,7 @@ def draw_map_state(gmap, particle_list=None, title="Wean Hall Map"):
     # Only show ticks on the left and bottom spines
     ax.yaxis.set_ticks_position('left')
     ax.xaxis.set_ticks_position('bottom')
-    ax.set_xlim(250,750)
+    
 
     #TODO: Draw particles
 
