@@ -125,8 +125,8 @@ class robot_particle():
             return False
 
 
-def raycast_bresenham(x,y,theta, global_map,
-                      threshold_val = 0.5, max_dist = 1000):
+def raycast_bresenham(x_cm, y_cm, theta, global_map,
+                      threshold_val = 0.5, max_dist_cm = 1000):
      """Brensenham line algorithm
      Input: x,y in cm, theta in radians, 
             global_map with 800x800 10-cm occupancy grid
@@ -135,14 +135,19 @@ def raycast_bresenham(x,y,theta, global_map,
      
      # Cast rays within 800x800 map (10cm * 800 X 10cm * 800)
 
+     x = x_cm//10
+     y = y_cm//10
+     max_dist = max_dist_cm//10
+
      #TODO: Implement with x,y in range 0~800 - will be much faster.
+
      x0 = x
      y0 = y
      x2 = x + int(max_dist * np.cos(theta))
      y2 = y + int(max_dist * np.sin(theta))
      # Short-circuit if inside wall
-     if global_map.values[x//10,y//10] < threshold_val :
-        return x, y, 0
+     if global_map.values[x,y] < threshold_val :
+        return x*10, y*10, 0
      steep = 0
      #coords = []
      dx = abs(x2 - x)
@@ -160,13 +165,13 @@ def raycast_bresenham(x,y,theta, global_map,
      try:
          for i in range(0,dx):
              if steep: # X and Y have been swapped  #coords.append((y,x))
-                if global_map.values[y//10, x//10] < threshold_val:
+                if global_map.values[y, x] < threshold_val:
                     dist = np.sqrt((y - x0)**2 + (x - y0)**2)
-                    return y, x, min(dist, max_dist)
+                    return y*10, x*10, min(dist, max_dist)*10
              else: #coords.append((x,y))
-                if global_map.values[x//10, y//10] < threshold_val:
+                if global_map.values[x, y] < threshold_val:
                     dist = np.sqrt((x - x0)**2 + (y - y0)**2)
-                    return x, y, min(dist, max_dist)
+                    return x*10, y*10, min(dist, max_dist)*10
              while d >= 0:
                  y = y + sy
                  d = d - (2 * dx)
@@ -178,7 +183,7 @@ def raycast_bresenham(x,y,theta, global_map,
              return x, y, max_dist
      except IndexError: # Out of range
         dist = np.sqrt((y - x0)**2 + (x - y0)**2)
-        return y, x, min(dist, max_dist)
+        return y*10, x*10, min(dist, max_dist)*10
 
 def new_pose_from_log_delta(old_log_pose, new_log_pose, current_pose):
     """Transforms movement from message frame to particle frame"""
