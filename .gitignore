@@ -3,3 +3,5 @@ __pycache__
 *.pyc
 *.log
 *.dat
+data/log/*
+data/map/*
