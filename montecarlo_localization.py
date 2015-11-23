@@ -125,15 +125,24 @@ class robot_particle():
             return False
 
 
-def raycast_bresenham(x,y,theta, global_map, threshold_val = 0.5):
+def raycast_bresenham(x,y,theta, global_map,
+                      threshold_val = 0.5, max_dist = 1000):
      """Brensenham line algorithm
+     Input: x,y in cm, theta in radians, 
+            global_map with 800x800 10-cm occupancy grid
+
      Ref: https://mail.scipy.org/pipermail/scipy-user/2009-September/022601.html"""
      
-     # Cast rays within 800x800 map
+     # Cast rays within 800x800 map (10cm * 800 X 10cm * 800)
+
+     #TODO: Implement with x,y in range 0~800 - will be much faster.
      x0 = x
      y0 = y
-     x2 = x + int(1000 * np.cos(theta))
-     y2 = y + int(1000 * np.sin(theta))
+     x2 = x + int(max_dist * np.cos(theta))
+     y2 = y + int(max_dist * np.sin(theta))
+     # Short-circuit if inside wall
+     if global_map.values[x//10,y//10] < threshold_val :
+        return x, y, 0
      steep = 0
      #coords = []
      dx = abs(x2 - x)
@@ -148,21 +157,28 @@ def raycast_bresenham(x,y,theta, global_map, threshold_val = 0.5):
          dx,dy = dy,dx
          sx,sy = sy,sx
      d = (2 * dy) - dx
-     for i in range(0,dx):
-         if steep: #coords.append((y,x))
-            if global_map.values[y//10, x//10] < threshold_val:
-                dist = np.sqrt((y - x0)^2 + (x - y0)^2)
-                return (y, x, dist)
-         else: #coords.append((x,y))
-            if global_map.values[x//10, y//10] < threshold_val:
-                dist = np.sqrt((x - x0)^2 + (y - y0)^2)
-                return (x, y, dist)
-         while d >= 0:
-             y = y + sy
-             d = d - (2 * dx)
-         x = x + sx
-         d = d + (2 * dy)
-     #return coords
+     try:
+         for i in range(0,dx):
+             if steep: # X and Y have been swapped  #coords.append((y,x))
+                if global_map.values[y//10, x//10] < threshold_val:
+                    dist = np.sqrt((y - x0)**2 + (x - y0)**2)
+                    return y, x, min(dist, max_dist)
+             else: #coords.append((x,y))
+                if global_map.values[x//10, y//10] < threshold_val:
+                    dist = np.sqrt((x - x0)**2 + (y - y0)**2)
+                    return x, y, min(dist, max_dist)
+             while d >= 0:
+                 y = y + sy
+                 d = d - (2 * dx)
+             x = x + sx
+             d = d + (2 * dy)
+         if steep:
+             return y, x, max_dist
+         else:
+             return x, y, max_dist
+     except IndexError: # Out of range
+        dist = np.sqrt((y - x0)**2 + (x - y0)**2)
+        return y, x, min(dist, max_dist)
 
 def new_pose_from_log_delta(old_log_pose, new_log_pose, current_pose):
     """Transforms movement from message frame to particle frame"""
@@ -217,11 +233,6 @@ def load_log(filepath):
     reordered_data['type'] = reordered_data['type'].map({'L':1, 'O':0})
     return reordered_data
 
-
-def sample_pose_uniform(xmin, xmax, ymin, ymax):
-    """Returns a single pose x,y,theta sampled uniformly"""
-    #TODO: return pose
-    pass
 
 def draw_map_state(gmap, particle_list=None, ax=None, title="Wean Hall Map",
                    rotate=True):
