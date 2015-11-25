@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import copy
 
-def mcl_update(particle_list, msg):
+def mcl_update(particle_list, msg, min_particles = 300):
     # msg: ['type','ts', 'x', 'y', 'theta', 'xl','yl', 'thetal', r1~r180]
     # 'type' is 1.0 for laser scan, 0.0 for odometry-only
     
@@ -26,11 +26,20 @@ def mcl_update(particle_list, msg):
     # SECOND: Re-sample particles in proportion to particle weight
     if msg[0] > 0.1: # Only re-sample particles after laser-scan update
         new_particle_list = [] 
-        particle_list_weights = [p.weight for p in particle_list]
+        particle_list_weights = [p.weight if p.position_valid() else 0.0
+                                 for p in particle_list]
+        # TODO: Re-weight particles from laser scan
         new_particle_list = sample_list_by_weight(particle_list, particle_list_weights)
         return new_particle_list
-    else: # No laser scan - just return same list of particles with updated weights
-        return particle_list
+    else: # No laser scan - just filter particles for validity
+        new_particle_list = [] 
+        for p in particle_list:
+            if p.position_valid():
+                new_particle_list.append(p)
+        while len(new_particle_list) < min_particles:
+            # Add back in new duplicate particles (every 10th)
+            new_particle_list.extend(new_particle_list[::10])
+        return new_particle_list
 
 
 def sample_list_by_weight(list_to_sample, list_element_weights, randomize_order=True):
@@ -72,10 +81,15 @@ class laser_sensor():
 
 class robot_particle():
     
-    def __init__(self, global_map, laser_sensor):
+    def __init__(self, global_map, laser_sensor,
+                 sigma_fwd_pct=.2, sigma_theta_pct=.05):
+        """sigma_[x,y,theta]_pct  represents stddev of movement over 1 unit as percentage
+            e.g., if true movement in X = 20cm, and sigma_x_pct=.1, then stddev = 2cm"""
         self.weight = 1.0 # Default initial weight
         self.laser_sensor = laser_sensor
         self.global_map = global_map
+        self.sigma_fwd_pct = sigma_fwd_pct
+        self.sigma_theta_pct = sigma_theta_pct
         self.init_pose()
 
     def init_pose(self):
@@ -105,12 +119,35 @@ class robot_particle():
         if self.prev_log_pose is None: # First iteration
             self.prev_log_pose = msg_pose
 
-        #TODO: Add stochasticity here
-        self.pose = new_pose_from_log_delta(self.prev_log_pose,
-                                            msg_pose,
-                                            self.pose)
+        # Includes stochastic error to change in pose, scaled to magnitude of change
+        self.new_pose_from_log_delta(msg_pose)
 
         self.prev_log_pose = msg_pose # Save previous log pose for delta
+        return self.pose
+
+    def new_pose_from_log_delta(self, new_log_pose):
+        """Transforms movement from message frame to particle frame,
+        adding error from self.sigma_fwd_pct and self.sigma_theta_pct"""
+        log_delta_x = new_log_pose[0] - self.prev_log_pose[0]
+        log_delta_y = new_log_pose[1] - self.prev_log_pose[1]
+        log_delta_theta = new_log_pose[2] - self.prev_log_pose[2]
+        # Fwd motion in log frame == Fwd motion in particle framea
+        #TODO: Change to x^2 + y^2
+        cos_theta = np.cos(new_log_pose[2])
+        if cos_theta > 0.1:
+            fwd_motion = log_delta_x / cos_theta 
+        else:  # Avoid numerical instability with divide by ~0
+            fwd_motion = log_delta_y / np.sin(new_log_pose[2])
+
+        # Calculate and add stochastic theta and forward error
+        new_theta_error = log_delta_theta * self.sigma_theta_pct * np.random.normal()
+        new_current_theta = self.pose[2] + log_delta_theta + new_theta_error
+        
+        fwd_motion_error = fwd_motion * self.sigma_fwd_pct * np.random.normal()
+        fwd_motion += fwd_motion_error
+        new_current_x = self.pose[0] + fwd_motion * np.cos(new_current_theta)
+        new_current_y = self.pose[1] + fwd_motion * np.sin(new_current_theta)
+        self.pose = np.array([new_current_x, new_current_y, new_current_theta])
         return self.pose
 
     def position_valid(self):
@@ -118,15 +155,20 @@ class robot_particle():
         y_pos = self.pose[1]
         nearest_xindex = x_pos//10
         nearest_yindex = y_pos //10
-        # High map values = clear space ( > ~0.8), low values = obstacle
-        if self.global_map.values[nearest_xindex, nearest_yindex] > 0.8:
-            return True
+ 
+        # Out of map! TODO: Don't hardcode map size
+        if 0 <= nearest_xindex < 800 and 0 <= nearest_yindex < 800: 
+            # High map values = clear space ( > ~0.8), low values = obstacle
+            if self.global_map.values[nearest_xindex, nearest_yindex] > 0.8:
+                return True
+            else:
+                return False
         else:
             return False
 
 
 def raycast_bresenham(x_cm, y_cm, theta, global_map,
-                      threshold_val = 0.5, max_dist_cm = 1000):
+                      freespace_min_val=0.5, max_dist_cm=1000):
      """Brensenham line algorithm
      Input: x,y in cm, theta in radians, 
             global_map with 800x800 10-cm occupancy grid
@@ -146,7 +188,7 @@ def raycast_bresenham(x_cm, y_cm, theta, global_map,
      x2 = x + int(max_dist * np.cos(theta))
      y2 = y + int(max_dist * np.sin(theta))
      # Short-circuit if inside wall
-     if global_map.values[x,y] < threshold_val :
+     if global_map.values[x,y] < freespace_min_val :
         return x*10, y*10, 0
      steep = 0
      #coords = []
@@ -156,7 +198,7 @@ def raycast_bresenham(x_cm, y_cm, theta, global_map,
      dy = abs(y2 - y)
      if (y2 - y) > 0: sy = 1
      else: sy = -1
-     if dy > dx:
+     if dy > dx: # Angle is steep - swap X and Y
          steep = 1
          x,y = y,x
          dx,dy = dy,dx
@@ -165,11 +207,11 @@ def raycast_bresenham(x_cm, y_cm, theta, global_map,
      try:
          for i in range(0,dx):
              if steep: # X and Y have been swapped  #coords.append((y,x))
-                if global_map.values[y, x] < threshold_val:
+                if global_map.values[y, x] < freespace_min_val:
                     dist = np.sqrt((y - x0)**2 + (x - y0)**2)
                     return y*10, x*10, min(dist, max_dist)*10
              else: #coords.append((x,y))
-                if global_map.values[x, y] < threshold_val:
+                if global_map.values[x, y] < freespace_min_val:
                     dist = np.sqrt((x - x0)**2 + (y - y0)**2)
                     return x*10, y*10, min(dist, max_dist)*10
              while d >= 0:
@@ -185,22 +227,7 @@ def raycast_bresenham(x_cm, y_cm, theta, global_map,
         dist = np.sqrt((y - x0)**2 + (x - y0)**2)
         return y*10, x*10, min(dist, max_dist)*10
 
-def new_pose_from_log_delta(old_log_pose, new_log_pose, current_pose):
-    """Transforms movement from message frame to particle frame"""
-    log_delta_x = new_log_pose[0] - old_log_pose[0]
-    log_delta_theta = new_log_pose[2] - old_log_pose[2]
-    # Fwd motion in log frame == Fwd motion in particle frame
-    cos_theta = np.cos(new_log_pose[2])
-    if cos_theta > 0.1:
-        fwd_motion = log_delta_x / cos_theta 
-    else:  # Avoid numerical instability with divide by ~0
-        log_delta_y = new_log_pose[1] - old_log_pose[1]
-        fwd_motion = log_delta_y / np.sin(new_log_pose[2])
 
-    new_current_theta = current_pose[2] + log_delta_theta
-    new_current_x = current_pose[0] + fwd_motion * np.cos(new_current_theta)
-    new_current_y = current_pose[1] + fwd_motion * np.sin(new_current_theta)
-    return np.array([new_current_x, new_current_y, new_current_theta])
 
 
 def load_log(filepath):
@@ -274,7 +301,7 @@ def draw_map_state(gmap, particle_list=None, ax=None, title="Wean Hall Map",
 
 
 
-def plot_particle(particle, ax=None, pass_pose=False):
+def plot_particle(particle, ax=None, pass_pose=False, color='b'):
     if ax is None:
         ax = plt.gca()
     if pass_pose:
@@ -285,8 +312,8 @@ def plot_particle(particle, ax=None, pass_pose=False):
     # 25cm is distance to actual sensor
     xt = x + 25*np.cos(theta)
     yt = y + 25*np.sin(theta)
-    circle = patches.CirclePolygon((x,y),facecolor='none', edgecolor='b',
+    circle = patches.CirclePolygon((x,y),facecolor='none', edgecolor=color,
                                    radius=25, resolution=20)
     ax.add_artist(circle)  
-    ax.plot([x, xt], [y, yt], color='b')
+    ax.plot([x, xt], [y, yt], color=color)
     return ax
