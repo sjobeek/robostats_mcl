@@ -12,6 +12,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import copy
+from scipy.spatial import distance
+
 
 def mcl_update(particle_list, msg, min_particles = 300):
     # msg: ['type','ts', 'x', 'y', 'theta', 'xl','yl', 'thetal', r1~r180]
@@ -19,16 +21,19 @@ def mcl_update(particle_list, msg, min_particles = 300):
     
     # FIRST: Update locations and weights of particles
     for particle in particle_list:
-        particle.sample_motion(msg)  # Update location
+        # Update location
+        particle.sample_motion(msg)  
         if msg[0] > 0.1: # Only update weights on laser scan
-            particle.measurement_likelihood(msg)  # Update weight
+            particle.update_measurement_likelihood(msg)  # Update weight
 
     # SECOND: Re-sample particles in proportion to particle weight
     if msg[0] > 0.1: # Only re-sample particles after laser-scan update
-        new_particle_list = [] 
         particle_list_weights = [p.weight if p.position_valid() else 0.0
                                  for p in particle_list]
-        # TODO: Re-weight particles from laser scan
+        # Renormalize weights if getting very small
+        if sum(particle_list_weights) < 1:
+            for p in particle_list:
+                p.weight *= 100
         new_particle_list = sample_list_by_weight(particle_list, particle_list_weights)
         return new_particle_list
     else: # No laser scan - just filter particles for validity
@@ -37,8 +42,9 @@ def mcl_update(particle_list, msg, min_particles = 300):
             if p.position_valid():
                 new_particle_list.append(p)
         while len(new_particle_list) < min_particles:
-            # Add back in new duplicate particles (every 10th)
-            new_particle_list.extend(new_particle_list[::10])
+            # Add back in new duplicate particles
+            duplicate_index = np.random.choice(range(len(new_particle_list)))
+            new_particle_list.append(copy.copy(new_particle_list[duplicate_index]))
         return new_particle_list
 
 
@@ -61,15 +67,36 @@ def sample_list_by_weight(list_to_sample, list_element_weights, randomize_order=
 
 
 class occupancy_map():
-    def __init__(self, map_filename):
+    def __init__(self, map_filename, range_filename='./data/range_array_120bin.npy'):
         self.map_filename = map_filename
-        self.load_map(self.map_filename)
+        self.range_filename = range_filename
+        self.load_map()
         
-    def load_map(self, map_filename):
-        gmap = pd.read_csv(map_filename, sep=' ', header=None,
+    def load_map(self):
+        gmap = pd.read_csv(self.map_filename, sep=' ', header=None,
                    skiprows=list(range(7)), )
         gmap.drop(800, axis=1, inplace=True) # Drop garbage values
         self.values = gmap.values
+        self.range_array = np.load(self.range_filename)
+
+    def ranges_180(self, x_cm, y_cm, theta_rads, n_buckets=120):
+        x_loc = x_cm//10
+        y_loc = y_cm//10
+        return np.array([self.range_array[x_loc,y_loc,bucket] for bucket in 
+                         theta_to_bucket_ids(theta_rads, n_buckets=n_buckets)])
+
+
+def rads_to_bucket_id(rads, n_buckets=120):
+    return int(((rads / (2*np.pi)) * n_buckets) % n_buckets)
+
+def theta_to_bucket_ids(theta_rads, n_buckets=120):
+    """Returns the bucket ids corresponding to 
+    -90 deg. to +90 deg around robot heading.
+    All parametrs use radians."""
+    start_theta = theta_rads - np.pi/2
+    start_bucket_id = rads_to_bucket_id(start_theta)
+    return [(start_bucket_id + i) % n_buckets 
+            for i in range(n_buckets//2)]
 
 
 class laser_sensor():
@@ -105,12 +132,21 @@ class robot_particle():
             self.pose = np.array([x_initial,y_initial,theta_initial])
             valid_pose = self.position_valid()
 
-    def measurement_likelihood(self, msg):
+    def update_measurement_likelihood(self, laser_msg):
         """Returns a new particle weight 
         High if actual measurement matches model"""
         #TODO: Implemente real weighting
-        self.weight = 1.0
-        return self.weight
+        msg_range_indicies = list(range(8,188))
+        actual_measurement = laser_msg[msg_range_indicies]
+        subsampled_measurements = actual_measurement[::3] #each third
+        #Expected measurements in 60 3-degree buckets, covering -90 to 90 degrees
+        expected_measurement = self.global_map.ranges_180(*self.pose)
+        # Cosine distance = close to 0 if identical. Close to 1 if far apart.
+        # Doesn't work well.
+        # TODO: Implement actual laser measurement model here 
+        dist = distance.cosine(subsampled_measurements, expected_measurement)
+        self.weight = self.weight * (1 - dist)
+        return dist
     
     def sample_motion(self, msg):
         """Returns a new (sampled) x,y position for next timestep"""
@@ -132,7 +168,7 @@ class robot_particle():
         log_delta_y = new_log_pose[1] - self.prev_log_pose[1]
         log_delta_theta = new_log_pose[2] - self.prev_log_pose[2]
         # Fwd motion in log frame == Fwd motion in particle framea
-        #TODO: Change to x^2 + y^2
+        #TODO: Change to x^2 + y^2 ??
         cos_theta = np.cos(new_log_pose[2])
         if cos_theta > 0.1:
             fwd_motion = log_delta_x / cos_theta 
@@ -142,6 +178,8 @@ class robot_particle():
         # Calculate and add stochastic theta and forward error
         new_theta_error = log_delta_theta * self.sigma_theta_pct * np.random.normal()
         new_current_theta = self.pose[2] + log_delta_theta + new_theta_error
+        # Wrap radians to enforce range 0 to 2pi
+        new_current_theta = new_current_theta % (2*np.pi)
         
         fwd_motion_error = fwd_motion * self.sigma_fwd_pct * np.random.normal()
         fwd_motion += fwd_motion_error
@@ -151,24 +189,20 @@ class robot_particle():
         return self.pose
 
     def position_valid(self):
-        x_pos = self.pose[0]
-        y_pos = self.pose[1]
-        nearest_xindex = x_pos//10
-        nearest_yindex = y_pos //10
- 
-        # Out of map! TODO: Don't hardcode map size
-        if 0 <= nearest_xindex < 800 and 0 <= nearest_yindex < 800: 
+        nearest_xindex = self.pose[0]//10
+        nearest_yindex = self.pose[1] //10
+        try:
             # High map values = clear space ( > ~0.8), low values = obstacle
             if self.global_map.values[nearest_xindex, nearest_yindex] > 0.8:
                 return True
             else:
                 return False
-        else:
+        except IndexError:
             return False
 
 
 def raycast_bresenham(x_cm, y_cm, theta, global_map,
-                      freespace_min_val=0.5, max_dist_cm=1000):
+                      freespace_min_val=0.5, max_dist_cm=8183):
      """Brensenham line algorithm
      Input: x,y in cm, theta in radians, 
             global_map with 800x800 10-cm occupancy grid
@@ -220,9 +254,11 @@ def raycast_bresenham(x_cm, y_cm, theta, global_map,
              x = x + sx
              d = d + (2 * dy)
          if steep:
-             return y, x, max_dist
+             dist = np.sqrt((y - x0)**2 + (x - y0)**2)
+             return y*10, x*10, min(dist, max_dist)*10
          else:
-             return x, y, max_dist
+             dist = np.sqrt((x - x0)**2 + (y - y0)**2)
+             return x*10, y*10, min(dist, max_dist)*10
      except IndexError: # Out of range
         dist = np.sqrt((y - x0)**2 + (x - y0)**2)
         return y*10, x*10, min(dist, max_dist)*10
