@@ -15,51 +15,68 @@ import copy
 from scipy.spatial import distance
 
 
-def mcl_update(particle_list, msg, min_particles = 300):
+def mcl_update(particle_list, msg, target_particles=300):
     # msg: ['type','ts', 'x', 'y', 'theta', 'xl','yl', 'thetal', r1~r180]
     # 'type' is 1.0 for laser scan, 0.0 for odometry-only
     
     # FIRST: Update locations and weights of particles
+    valid_particles = []
     for particle in particle_list:
         # Update location
-        particle.sample_motion(msg)  
-        if msg[0] > 0.1: # Only update weights on laser scan
+        particle.sample_motion(msg)
+        if particle.position_valid():
+            valid_particles.append(particle)
+
+        if msg[0] > 0.1: # This message has a laser scan
             particle.update_measurement_likelihood(msg)  # Update weight
 
     # SECOND: Re-sample particles in proportion to particle weight
-    if msg[0] > 0.1: # Only re-sample particles after laser-scan update
-        particle_list_weights = [p.weight if p.position_valid() else 0.0
-                                 for p in particle_list]
-        # Renormalize weights if getting very small
-        if sum(particle_list_weights) < 1:
-            for p in particle_list:
-                p.weight *= 100
-        new_particle_list = sample_list_by_weight(particle_list, particle_list_weights)
-        return new_particle_list
-    else: # No laser scan - just filter particles for validity
-        new_particle_list = [] 
-        for p in particle_list:
-            if p.position_valid():
-                new_particle_list.append(p)
-        while len(new_particle_list) < min_particles:
+    if msg[0] > 0.1: # This message has a laser scan
+        particle_list_weights = [p.weight for p in valid_particles]
+        # Renormalize particle weights - often get too small
+        if sum(particle_list_weights) < 0.01:
+            renormalize_particle_weights(valid_particles)
+
+        new_particle_list = sample_list_by_weight(valid_particles, particle_list_weights, 
+                                                  max_target_particles=target_particles)
+    else:
+        new_particle_list = valid_particles
+        
+    # THIRD: Spaw more particles if low
+    list_len = len(new_particle_list)
+    while list_len < target_particles:
             # Add back in new duplicate particles
-            duplicate_index = np.random.choice(range(len(new_particle_list)))
+            duplicate_index = np.random.choice(range(list_len))
             new_particle_list.append(copy.copy(new_particle_list[duplicate_index]))
-        return new_particle_list
+            list_len = len(new_particle_list)
+
+    return new_particle_list
+
+def renormalize_particle_weights(particle_list):
+    total_weight = sum(p.weight for p in particle_list)
+    for p in particle_list:
+        p.weight = p.weight * (1 / total_weight)
 
 
-def sample_list_by_weight(list_to_sample, list_element_weights, randomize_order=True):
+def sample_list_by_weight(list_to_sample, list_element_weights, randomize_order=False,
+                          perturb=True, max_target_particles=100000):
     new_sampled_list = []
     array_element_weights = np.array(list_element_weights)
     normed_weights = array_element_weights / array_element_weights.sum()
     list_idx_choices = np.random.multinomial(len(normed_weights), normed_weights)
     # list_idx_choices of form [0, 0, 2, 0, 1, 0, 4] for length 7 list_to_sample
+    total_particles = 0
     for idx, count in enumerate(list_idx_choices):
+        total_particles += 1
         while count > 0:
             if count == 1:
                 new_sampled_list.append(list_to_sample[idx])
-            else: # Need to add copies to new list, not just identical references! 
-                new_sampled_list.append(copy.copy(list_to_sample[idx]))
+            elif count < 4 or total_particles < max_target_particles: # Stop duplicating if max reached
+                # Need to add copies to new list, not just identical references! 
+                new_particle = copy.copy(list_to_sample[idx])
+                if perturb:
+                    new_particle.new_pose_from_sample_error(10)
+                new_sampled_list.append(new_particle)
             count -= 1
     if randomize_order:   # Not required, but nice for random order
         np.random.shuffle(new_sampled_list)
@@ -80,10 +97,16 @@ class occupancy_map():
         self.range_array = np.load(self.range_filename)
 
     def ranges_180(self, x_cm, y_cm, theta_rads, n_buckets=120):
-        x_loc = x_cm//10
-        y_loc = y_cm//10
-        return np.array([self.range_array[x_loc,y_loc,bucket] for bucket in 
-                         theta_to_bucket_ids(theta_rads, n_buckets=n_buckets)])
+        x_loc = min(x_cm//10, 799)
+        y_loc = min(y_cm//10, 799)
+        bucket_id_list_a, bucket_id_list_b =  theta_to_bucket_ids(theta_rads, n_buckets=n_buckets)
+        
+        if len(bucket_id_list_b) == 0: #Just return continuous array
+            return self.range_array[x_loc,y_loc,bucket_id_list_a[0]:bucket_id_list_a[-1]+1]
+        else: # Need to stick together two arrays
+            arrayA = self.range_array[x_loc,y_loc,bucket_id_list_a[0]:bucket_id_list_a[-1]+1]
+            arrayB = self.range_array[x_loc,y_loc,bucket_id_list_b[0]:bucket_id_list_b[-1]+1]
+            return np.concatenate([arrayA, arrayB])
 
 
 def rads_to_bucket_id(rads, n_buckets=120):
@@ -95,28 +118,68 @@ def theta_to_bucket_ids(theta_rads, n_buckets=120):
     All parametrs use radians."""
     start_theta = theta_rads - np.pi/2
     start_bucket_id = rads_to_bucket_id(start_theta)
-    return [(start_bucket_id + i) % n_buckets 
-            for i in range(n_buckets//2)]
+    bucket_id_list_a = []
+    bucket_id_list_b = []
+    for i in range(n_buckets//2):
+        idx = i + start_bucket_id
+        if idx < n_buckets:
+            bucket_id_list_a.append(idx)
+        else:
+            bucket_id_list_b.append(idx % n_buckets)
+
+    return bucket_id_list_a, bucket_id_list_b
 
 
 class laser_sensor():
     """Defines laser sensor with specific meaasurement model"""
-    def __init__(self):
-        #TODO:
+    def __init__(self, stdv_cm=40, max_range=8000,
+                 uniform_weight=0.2):
+        """Uniform probability added equivaent to 1/max_range"""
+        assert 0.0 <= uniform_weight <= 1.0
+        self.stdv_cm = stdv_cm
+        self.normal_weight = 1 - uniform_weight
+        self.uniform_weight = uniform_weight
+        self.max_range = max_range
+
+        # Create scaling factor for total probabilities
+        perfect_match_probs = self.measurement_probabilities(np.array(list(range(10))), 
+                                                              np.array(list(range(10))))
+        self.measurement_prob_scaling_factor = 1/perfect_match_probs[0]
         pass
+
+    def measurement_probabilities(self, sampled_measurements, expected_measurements):
+        squared_diff_array = (sampled_measurements - expected_measurements) ** 2
+        # Bring probability constant into exp term:  ae^x = e^(x + log(a))
+        prob_normal_array = (1/(np.sqrt(2*np.pi*self.stdv_cm)) *
+                             np.exp((-1 / (2 * self.stdv_cm)) * squared_diff_array))
+                                
+        weighted_probs = (self.normal_weight * prob_normal_array +
+                          self.uniform_weight * (1 / self.max_range))
+        return weighted_probs
+
+    def full_scan_log_prob(self, measurement_probabilities):
+        # Sum Multiply all probabilities in log space (= sum), including scaling factor
+        # scaling factor == perfect match will retun scaled weight of 1
+        return np.sum(np.log(measurement_probabilities *
+                             self.measurement_prob_scaling_factor))
 
 
 class robot_particle():
     
     def __init__(self, global_map, laser_sensor,
-                 sigma_fwd_pct=.2, sigma_theta_pct=.05):
+                 sigma_fwd_pct=.2, sigma_theta_pct=.05,
+                 log_prob_descale=60):
         """sigma_[x,y,theta]_pct  represents stddev of movement over 1 unit as percentage
-            e.g., if true movement in X = 20cm, and sigma_x_pct=.1, then stddev = 2cm"""
+            e.g., if true movement in X = 20cm, and sigma_x_pct=.1, then stddev = 2cm
+            log_prob_descale affects magnitude of snesor updates:
+                    low values = each sensor update hugely affects weights
+                    high values (~100) each sensor update gradually affects weights"""
         self.weight = 1.0 # Default initial weight
         self.laser_sensor = laser_sensor
         self.global_map = global_map
         self.sigma_fwd_pct = sigma_fwd_pct
         self.sigma_theta_pct = sigma_theta_pct
+        self.log_prob_descale=log_prob_descale
         self.init_pose()
 
     def init_pose(self):
@@ -138,15 +201,17 @@ class robot_particle():
         #TODO: Implemente real weighting
         msg_range_indicies = list(range(8,188))
         actual_measurement = laser_msg[msg_range_indicies]
-        subsampled_measurements = actual_measurement[::3] #each third
+        subsampled_measurements = actual_measurement[::3] # sample 3-degree increments
         #Expected measurements in 60 3-degree buckets, covering -90 to 90 degrees
-        expected_measurement = self.global_map.ranges_180(*self.pose)
-        # Cosine distance = close to 0 if identical. Close to 1 if far apart.
-        # Doesn't work well.
-        # TODO: Implement actual laser measurement model here 
-        dist = distance.cosine(subsampled_measurements, expected_measurement)
-        self.weight = self.weight * (1 - dist)
-        return dist
+        expected_measurements = self.global_map.ranges_180(*self.pose)
+       
+        beam_probabilities = self.laser_sensor.measurement_probabilities(
+                                    subsampled_measurements, expected_measurements)
+        single_scan_log_prob = self.laser_sensor.full_scan_log_prob(beam_probabilities)
+
+        # TODO: better handle massive down-scaling here (prob is often 1e-150 ~ 1e-250 !)
+        self.weight = self.weight * np.exp(single_scan_log_prob / self.log_prob_descale) # Reduce by e^100
+        return np.exp(single_scan_log_prob)
     
     def sample_motion(self, msg):
         """Returns a new (sampled) x,y position for next timestep"""
@@ -159,6 +224,23 @@ class robot_particle():
         self.new_pose_from_log_delta(msg_pose)
 
         self.prev_log_pose = msg_pose # Save previous log pose for delta
+        return self.pose
+
+    def new_pose_from_sample_error(self, scale=10):
+        """Simply perterbs current position"""
+        # Calculate and add stochastic theta and forward error
+        valid_pose=False
+        while not valid_pose:
+            new_theta_error = (scale/5) * self.sigma_theta_pct * np.random.normal()
+            new_current_theta = self.pose[2] + new_theta_error
+            # Wrap radians to enforce range 0 to 2pi
+            new_current_theta = new_current_theta % (2*np.pi)
+            
+            new_current_x = self.pose[0] + scale * self.sigma_fwd_pct * np.random.normal()
+            new_current_y = self.pose[1] + scale * self.sigma_fwd_pct * np.random.normal()
+            self.pose = np.array([new_current_x, new_current_y, new_current_theta])
+            valid_pose = self.position_valid()
+
         return self.pose
 
     def new_pose_from_log_delta(self, new_log_pose):
