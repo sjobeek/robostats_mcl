@@ -13,9 +13,12 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import copy
 from scipy.spatial import distance
+import base64
+from IPython.display import HTML
 
 
-def mcl_update(particle_list, msg, target_particles=300):
+def mcl_update(particle_list, msg, target_particles=300, 
+               new_particles_per_round=0, resample=True):
     # msg: ['type','ts', 'x', 'y', 'theta', 'xl','yl', 'thetal', r1~r180]
     # 'type' is 1.0 for laser scan, 0.0 for odometry-only
     
@@ -31,14 +34,25 @@ def mcl_update(particle_list, msg, target_particles=300):
             particle.update_measurement_likelihood(msg)  # Update weight
 
     # SECOND: Re-sample particles in proportion to particle weight
-    if msg[0] > 0.1: # This message has a laser scan
+    if msg[0] > 0.1 and resample: # This message has a laser scan
         particle_list_weights = [p.weight for p in valid_particles]
+
         # Renormalize particle weights - often get too small
         if sum(particle_list_weights) < 0.01:
             renormalize_particle_weights(valid_particles)
 
         new_particle_list = sample_list_by_weight(valid_particles, particle_list_weights, 
-                                                  max_target_particles=target_particles)
+                                                  max_target_particles=target_particles) 
+        if new_particles_per_round > 0:
+            # Add a few new particles with average weights
+            P = new_particle_list[0]  # Using same initialization as other particles
+            new_particle_list_weights = [p.weight for p in new_particle_list]
+            for _ in range(new_particles_per_round):
+                new_particle = robot_particle(P.global_map, P.laser_sensor, 
+                                              P.sigma_fwd_pct, P.sigma_theta_pct,
+                                              P.log_prob_descale)
+                new_particle.weight = np.average(new_particle_list_weights)
+                new_particle_list.append(new_particle)
     else:
         new_particle_list = valid_particles
         
@@ -50,6 +64,9 @@ def mcl_update(particle_list, msg, target_particles=300):
             new_particle_list.append(copy.copy(new_particle_list[duplicate_index]))
             list_len = len(new_particle_list)
 
+    # Add a few new particles each round
+    
+
     return new_particle_list
 
 def renormalize_particle_weights(particle_list):
@@ -58,8 +75,12 @@ def renormalize_particle_weights(particle_list):
         p.weight = p.weight * (1 / total_weight)
 
 
-def sample_list_by_weight(list_to_sample, list_element_weights, randomize_order=False,
-                          perturb=True, max_target_particles=100000):
+def sample_list_by_weight(list_to_sample, list_element_weights, randomize_order=True,
+                          perturb=True, max_target_particles=10000):
+    """Samples new particles with probability proportional to their weight.
+        If current particle count is above max_target_particles,
+        duplicate particles are surpressed"""
+
     new_sampled_list = []
     array_element_weights = np.array(list_element_weights)
     normed_weights = array_element_weights / array_element_weights.sum()
@@ -71,7 +92,7 @@ def sample_list_by_weight(list_to_sample, list_element_weights, randomize_order=
         while count > 0:
             if count == 1:
                 new_sampled_list.append(list_to_sample[idx])
-            elif count < 4 or total_particles < max_target_particles: # Stop duplicating if max reached
+            elif count < 3 or total_particles < max_target_particles: # Stop duplicating if max reached
                 # Need to add copies to new list, not just identical references! 
                 new_particle = copy.copy(list_to_sample[idx])
                 if perturb:
@@ -173,13 +194,14 @@ class robot_particle():
             e.g., if true movement in X = 20cm, and sigma_x_pct=.1, then stddev = 2cm
             log_prob_descale affects magnitude of snesor updates:
                     low values = each sensor update hugely affects weights
-                    high values (~100) each sensor update gradually affects weights"""
+                    high values (~1000) each sensor update gradually affects weights"""
         self.weight = 1.0 # Default initial weight
-        self.laser_sensor = laser_sensor
+        
         self.global_map = global_map
+        self.laser_sensor = laser_sensor
         self.sigma_fwd_pct = sigma_fwd_pct
         self.sigma_theta_pct = sigma_theta_pct
-        self.log_prob_descale=log_prob_descale
+        self.log_prob_descale = log_prob_descale
         self.init_pose()
 
     def init_pose(self):
@@ -202,8 +224,11 @@ class robot_particle():
         msg_range_indicies = list(range(8,188))
         actual_measurement = laser_msg[msg_range_indicies]
         subsampled_measurements = actual_measurement[::3] # sample 3-degree increments
+        # Laser located 25cm ahead of robot center (in x direction)
+        laser_pose_x = self.pose[0] + 25*np.cos(self.pose[2])
+        laser_pose_y = self.pose[1] + 25*np.sin(self.pose[2])
         #Expected measurements in 60 3-degree buckets, covering -90 to 90 degrees
-        expected_measurements = self.global_map.ranges_180(*self.pose)
+        expected_measurements = self.global_map.ranges_180(laser_pose_x, laser_pose_y, self.pose[2])
        
         beam_probabilities = self.laser_sensor.measurement_probabilities(
                                     subsampled_measurements, expected_measurements)
@@ -348,7 +373,7 @@ def raycast_bresenham(x_cm, y_cm, theta, global_map,
 
 
 
-def load_log(filepath):
+def load_log(filepath, skiprows=0):
     """Log comes in two types:
     Type O (remapped to 0.0):  
     x y theta - coordinates of the robot in standard odometry frame
@@ -364,8 +389,11 @@ def load_log(filepath):
     the laser readings are in counterclockwise order.
     ts - timestamp of laser reading
     """
- 
-    raw_df = pd.read_csv(filepath, sep=' ',header=None)
+    try:
+        raw_df = pd.read_csv(filepath, sep=' ',header=None)
+    except pd.parser.CParserError:
+        raw_df = pd.read_csv(filepath, sep=' ',header=None, skiprows=1)
+
     # Extract and label odometry data
     odometry = raw_df[raw_df[0] == 'O'][list(range(5))]
     odometry.columns = ["type", "x", "y", "theta", "ts"]
@@ -385,7 +413,7 @@ def load_log(filepath):
 
 
 def draw_map_state(gmap, particle_list=None, ax=None, title="Wean Hall Map",
-                   rotate=True):
+                   rotate=True, draw_max=2000):
     
     if ax is None:
         fig, ax = plt.subplots(figsize=(10, 10))
@@ -413,7 +441,9 @@ def draw_map_state(gmap, particle_list=None, ax=None, title="Wean Hall Map",
     ax.xaxis.set_ticks_position('bottom')
     
     if particle_list is not None:
-        for particle in particle_list:
+        for i, particle in enumerate(particle_list):
+            if i >= draw_max:
+                break
             plot_particle(particle, ax) # Scale to 1/10th scale map
     return ax
 
@@ -435,3 +465,15 @@ def plot_particle(particle, ax=None, pass_pose=False, color='b'):
     ax.add_artist(circle)  
     ax.plot([x, xt], [y, yt], color=color)
     return ax
+
+def mp4_to_html(filepath):
+    #TODO: Move to new utilities file
+    VIDEO_TAG = """<video width="500" height=auto controls>
+     <source src="data:video/x-m4v;base64,{0}" type="video/mp4">
+     Your browser does not support the video tag.
+    </video>"""
+
+    with open(filepath, "rb") as video:
+        encoded_video = base64.b64encode(video.read()).decode('utf-8')
+
+    return HTML(VIDEO_TAG.format(encoded_video))
